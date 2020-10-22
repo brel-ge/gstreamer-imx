@@ -78,6 +78,13 @@ struct _GstImxV4l2VideoSrc
 	guint metaCropY;
 	guint metaCropWidth;
 	guint metaCropHeight;
+
+	guint inputCropTop;
+	guint inputCropLeft;
+	guint inputCropWidth;
+	guint inputCropHeight;
+
+	guint rotate;
 };
 
 struct _GstImxV4l2VideoSrcClass

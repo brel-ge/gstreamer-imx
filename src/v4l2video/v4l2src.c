@@ -42,6 +42,7 @@
 #define DEFAULT_CROP_META_Y 0
 #define DEFAULT_CROP_META_WIDTH 0
 #define DEFAULT_CROP_META_HEIGHT 0
+#define DEFAULT_CROP_INPUT 0
 
 enum
 {
@@ -57,6 +58,10 @@ enum
 	IMX_V4L2SRC_CROP_META_Y,
 	IMX_V4L2SRC_CROP_META_WIDTH,
 	IMX_V4L2SRC_CROP_META_HEIGHT,
+	IMX_V4L2SRC_CROP_INPUT_TOP,
+	IMX_V4L2SRC_CROP_INPUT_LEFT,
+	IMX_V4L2SRC_CROP_INPUT_WIDTH,
+	IMX_V4L2SRC_CROP_INPUT_HEIGHT,
 
 	/* Properties required to be recongnized by GstPhotography implementor */
 	PROP_WB_MODE,
@@ -304,6 +309,20 @@ static gint gst_imx_v4l2src_capture_setup(GstImxV4l2VideoSrc *v4l2src)
 			gst_caps_unref(allowed_format_caps);
 	}
 
+	if(v4l2src->inputCropWidth && v4l2src->inputCropHeight) {
+		struct v4l2_crop icrop = {0};
+		icrop.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+		icrop.c.left = v4l2src->inputCropLeft;
+		icrop.c.top = v4l2src->inputCropTop;
+		icrop.c.width = v4l2src->inputCropWidth;
+		icrop.c.height =  v4l2src->inputCropHeight;
+		if(ioctl(fd_v4l, VIDIOC_S_CROP, &icrop) < 0)
+		{
+			GST_ERROR_OBJECT(v4l2src, "VIDIOC_S_CROP failed: %s", strerror(errno));
+			goto fail;
+		}
+	}
+
 	fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
 	fmt.fmt.pix.bytesperline = 0;
 	fmt.fmt.pix.priv = 0;
@@ -484,6 +503,8 @@ static GstCaps *gst_imx_v4l2src_caps_for_current_setup(GstImxV4l2VideoSrc *v4l2s
 	const gchar *pixel_format = NULL;
 	const gchar *interlace_mode = NULL;
 	struct v4l2_format fmt;
+	gint width = v4l2src->capture_width;
+	gint height = v4l2src->capture_height;
 
 	fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
 	if (ioctl(GST_IMX_FD_OBJECT_GET_FD(v4l2src->fd_obj_v4l), VIDIOC_G_FMT, &fmt) < 0)
@@ -633,10 +654,16 @@ static GstCaps *gst_imx_v4l2src_caps_for_current_setup(GstImxV4l2VideoSrc *v4l2s
 			interlace_mode = "progressive";
 	}
 
+	if(v4l2src->inputCropWidth && v4l2src->inputCropHeight)
+	{
+		width = v4l2src->inputCropWidth;
+		height = v4l2src->inputCropHeight;
+	}
+
 	return gst_caps_new_simple("video/x-raw",
 			"format", G_TYPE_STRING, pixel_format,
-			"width", G_TYPE_INT, v4l2src->capture_width,
-			"height", G_TYPE_INT, v4l2src->capture_height,
+			"width", G_TYPE_INT, width,
+			"height", G_TYPE_INT, height,
 			"interlace-mode", G_TYPE_STRING, interlace_mode,
 			"framerate", GST_TYPE_FRACTION, v4l2src->fps_n, v4l2src->fps_d,
 			"pixel-aspect-ratio", GST_TYPE_FRACTION, 1, 1,
@@ -745,6 +772,22 @@ static void gst_imx_v4l2src_set_property(GObject *object, guint prop_id,
 			v4l2src->metaCropHeight = g_value_get_int(value);
 			break;
 
+		case IMX_V4L2SRC_CROP_INPUT_TOP:
+			v4l2src->inputCropTop = g_value_get_int(value);
+			break;
+
+		case IMX_V4L2SRC_CROP_INPUT_LEFT:
+			v4l2src->inputCropLeft = g_value_get_int(value);
+			break;
+
+		case IMX_V4L2SRC_CROP_INPUT_WIDTH:
+			v4l2src->inputCropWidth = g_value_get_int(value);
+			break;
+
+		case IMX_V4L2SRC_CROP_INPUT_HEIGHT:
+			v4l2src->inputCropHeight = g_value_get_int(value);
+			break;
+
 		case PROP_FOCUS_MODE:
 			gst_imx_v4l2src_set_focus_mode(GST_PHOTOGRAPHY(v4l2src), g_value_get_enum(value));
 			break;
@@ -827,6 +870,22 @@ static void gst_imx_v4l2src_get_property(GObject *object, guint prop_id,
 
 		case IMX_V4L2SRC_CROP_META_HEIGHT:
 			g_value_set_int(value, v4l2src->metaCropHeight);
+			break;
+
+		case IMX_V4L2SRC_CROP_INPUT_TOP:
+			g_value_set_int(value, v4l2src->inputCropTop);
+			break;
+
+		case IMX_V4L2SRC_CROP_INPUT_LEFT:
+			g_value_set_int(value, v4l2src->inputCropLeft);
+			break;
+
+		case IMX_V4L2SRC_CROP_INPUT_WIDTH:
+			g_value_set_int(value, v4l2src->inputCropWidth);
+			break;
+
+		case IMX_V4L2SRC_CROP_INPUT_HEIGHT:
+			g_value_set_int(value, v4l2src->inputCropHeight);
 			break;
 
 		case PROP_FOCUS_MODE:
@@ -937,6 +996,10 @@ static void gst_imx_v4l2src_init(GstImxV4l2VideoSrc *v4l2src)
 	v4l2src->metaCropY = DEFAULT_CROP_META_Y;
 	v4l2src->metaCropWidth = DEFAULT_CROP_META_WIDTH;
 	v4l2src->metaCropHeight = DEFAULT_CROP_META_HEIGHT;
+	v4l2src->inputCropTop = DEFAULT_CROP_INPUT;
+	v4l2src->inputCropLeft = DEFAULT_CROP_INPUT;
+	v4l2src->inputCropWidth = DEFAULT_CROP_INPUT;
+	v4l2src->inputCropHeight = DEFAULT_CROP_INPUT;
 
 	g_mutex_init(&v4l2src->af_mutex);
 	v4l2src->focus_mode = GST_PHOTOGRAPHY_FOCUS_MODE_AUTO;
@@ -1046,6 +1109,30 @@ static void gst_imx_v4l2src_class_init(GstImxV4l2VideoSrcClass *klass)
 			g_param_spec_int("crop-meta-height", "Crop meta HEIGHT",
 				"HEIGHT value for crop metadata",
 				0, G_MAXINT, DEFAULT_CROP_META_HEIGHT,
+				G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
+	g_object_class_install_property(gobject_class, IMX_V4L2SRC_CROP_INPUT_TOP,
+			g_param_spec_int("crop-input-top", "Crop input top",
+				"TOP value for input crop",
+				0, G_MAXINT, DEFAULT_CROP_INPUT,
+				G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
+	g_object_class_install_property(gobject_class, IMX_V4L2SRC_CROP_INPUT_LEFT,
+			g_param_spec_int("crop-input-left", "Crop input left",
+				"LEFT value for input crop",
+				0, G_MAXINT, DEFAULT_CROP_INPUT,
+				G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
+	g_object_class_install_property(gobject_class, IMX_V4L2SRC_CROP_INPUT_WIDTH,
+			g_param_spec_int("crop-input-width", "Crop input width",
+				"WIDTH value for input crop",
+				0, G_MAXINT, DEFAULT_CROP_INPUT,
+				G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
+	g_object_class_install_property(gobject_class, IMX_V4L2SRC_CROP_INPUT_HEIGHT,
+			g_param_spec_int("crop-input-height", "Crop input height",
+				"HEIGHT value for input crop",
+				0, G_MAXINT, DEFAULT_CROP_INPUT,
 				G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
 
 	/* Being GstPhotography implementation implies overriding all properties
