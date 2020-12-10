@@ -102,7 +102,7 @@ static void gst_imx_phys_mem_allocator_finalize(GObject *object)
 static GstImxPhysMemory* gst_imx_phys_mem_new_internal(GstImxPhysMemAllocator *phys_mem_alloc, GstMemory *parent, gsize maxsize, GstMemoryFlags flags, gsize align, gsize offset, gsize size)
 {
 	GstImxPhysMemory *phys_mem;
-	phys_mem = g_slice_alloc(sizeof(GstImxPhysMemory));
+	phys_mem = g_slice_alloc0(sizeof(GstImxPhysMemory));
 	if (phys_mem == NULL)
 	{
 		GST_ERROR_OBJECT(phys_mem_alloc, "could not allocate memory for physmem structure");
@@ -111,7 +111,8 @@ static GstImxPhysMemory* gst_imx_phys_mem_new_internal(GstImxPhysMemAllocator *p
 
 	phys_mem->mapped_virt_addr = NULL;
 	phys_mem->phys_addr = 0;
-	phys_mem->mapping_refcount = 0;
+	g_atomic_int_set(&phys_mem->mapping_refcount, 0);
+	g_mutex_init(&phys_mem->mutex);
 	phys_mem->internal = NULL;
 
 	gst_memory_init(GST_MEMORY_CAST(phys_mem), flags, GST_ALLOCATOR_CAST(phys_mem_alloc), parent, maxsize, align, offset, size);
@@ -185,7 +186,16 @@ static void gst_imx_phys_mem_allocator_free(GstAllocator *allocator, GstMemory *
 	GstImxPhysMemAllocator *phys_mem_alloc = GST_IMX_PHYS_MEM_ALLOCATOR(allocator);
 	GstImxPhysMemAllocatorClass *klass = GST_IMX_PHYS_MEM_ALLOCATOR_CLASS(G_OBJECT_GET_CLASS(allocator));
 
+	g_mutex_lock(&phys_mem->mutex);
+
+	while (g_atomic_int_dec_and_test(&phys_mem->mapping_refcount))
+	{
+		GST_LOG_OBJECT(phys_mem_alloc, "unmapping memory block %p (phys addr %" GST_IMX_PHYS_ADDR_FORMAT "), current mapping refcount = %ld -> %ld",(gpointer)phys_mem, phys_mem->phys_addr, phys_mem->mapping_refcount, (phys_mem->mapping_refcount > 0) ? (phys_mem->mapping_refcount - 1) : 0);
+		klass->unmap_phys_mem(phys_mem_alloc, phys_mem);
+	}
 	klass->free_phys_mem(phys_mem_alloc, phys_mem);
+
+	g_mutex_unlock(&phys_mem->mutex);
 
 	GST_INFO_OBJECT(allocator, "freed block %p at phys addr %" GST_IMX_PHYS_ADDR_FORMAT " with size: %u", (gpointer)memory, phys_mem->phys_addr, memory->size);
 
@@ -201,22 +211,7 @@ static gpointer gst_imx_phys_mem_allocator_map(GstMemory *mem, gsize maxsize, Gs
 
 	GST_LOG_OBJECT(phys_mem_alloc, "mapping %u bytes from memory block %p (phys addr %" GST_IMX_PHYS_ADDR_FORMAT "), current mapping refcount = %ld -> %ld", maxsize, (gpointer)mem, phys_mem->phys_addr, phys_mem->mapping_refcount, phys_mem->mapping_refcount + 1);
 
-	phys_mem->mapping_refcount++;
-
-	/* In GStreamer, it is not possible to map the same buffer several times
-	 * with different flags. Therefore, it is safe to use refcounting here,
-	 * since the value of "flags" will be the same with multiple map calls. */
-
-	if (phys_mem->mapping_refcount == 1)
-	{
-		phys_mem->mapping_flags = flags;
-		return klass->map_phys_mem(phys_mem_alloc, phys_mem, maxsize, flags);
-	}
-	else
-	{
-		g_assert(phys_mem->mapping_flags == flags);
-		return phys_mem->mapped_virt_addr;
-	}
+	return klass->map_phys_mem(phys_mem_alloc, phys_mem, maxsize, flags);
 }
 
 
@@ -228,18 +223,14 @@ static void gst_imx_phys_mem_allocator_unmap(GstMemory *mem)
 
 	GST_LOG_OBJECT(phys_mem_alloc, "unmapping memory block %p (phys addr %" GST_IMX_PHYS_ADDR_FORMAT "), current mapping refcount = %ld -> %ld", (gpointer)mem, phys_mem->phys_addr, phys_mem->mapping_refcount, (phys_mem->mapping_refcount > 0) ? (phys_mem->mapping_refcount - 1) : 0);
 
-	if (phys_mem->mapping_refcount > 0)
-	{
-		phys_mem->mapping_refcount--;
-		if (phys_mem->mapping_refcount == 0)
-			klass->unmap_phys_mem(phys_mem_alloc, phys_mem);
-	}
+	klass->unmap_phys_mem(phys_mem_alloc, phys_mem);
 }
 
 
 static GstMemory* gst_imx_phys_mem_allocator_copy(GstMemory *mem, gssize offset, gssize size)
 {
 	GstImxPhysMemory *copy;
+	GstImxPhysMemory *phys_mem = (GstImxPhysMemory *)mem;
 	GstImxPhysMemAllocator *phys_mem_alloc = (GstImxPhysMemAllocator*)(mem->allocator);
 
 	if (size == -1)
@@ -253,16 +244,22 @@ static GstMemory* gst_imx_phys_mem_allocator_copy(GstMemory *mem, gssize offset,
 	}
 
 	{
-		gpointer srcptr, destptr;
+		gpointer srcptr, destptr = NULL;
 		GstImxPhysMemAllocatorClass *klass = GST_IMX_PHYS_MEM_ALLOCATOR_CLASS(G_OBJECT_GET_CLASS(mem->allocator));
 
-		srcptr = klass->map_phys_mem(phys_mem_alloc, (GstImxPhysMemory *)mem, mem->maxsize, GST_MAP_READ);
+		srcptr = gst_imx_phys_mem_allocator_map(mem, mem->maxsize, GST_MAP_READ);
 		destptr = klass->map_phys_mem(phys_mem_alloc, copy, mem->maxsize, GST_MAP_WRITE);
 
-		memcpy(destptr, srcptr, mem->maxsize);
-
-		klass->unmap_phys_mem(phys_mem_alloc, copy);
-		klass->unmap_phys_mem(phys_mem_alloc, (GstImxPhysMemory *)mem);
+		if (srcptr == NULL)
+		{
+			memset(destptr, 0, mem->maxsize);
+			GST_ERROR_OBJECT(phys_mem_alloc, "could not copy memory block - src mem == %p, refcount %i destptr == %p", mem, phys_mem->mapping_refcount, destptr);
+		}
+		else
+		{
+			memcpy(destptr, srcptr, mem->maxsize);
+			gst_imx_phys_mem_allocator_unmap(mem);
+		}
 	}
 
 	GST_INFO_OBJECT(

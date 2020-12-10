@@ -101,23 +101,35 @@ static gpointer gst_imx_ipu_map_phys_mem(GstImxPhysMemAllocator *allocator, GstI
 	int prot = 0;
 	GstImxIpuAllocator *ipu_allocator = GST_IMX_IPU_ALLOCATOR(allocator);
 
-	g_assert(phys_mem->mapped_virt_addr == NULL);
 
-	/* As explained in gst_imx_phys_mem_allocator_map(), the flags are guaranteed to
-	 * be the same when a memory block is mapped multiple times, so the value of
-	 * "flags" will be identical if map() is called two times, for example. */
+	/* In GStreamer, it is not possible to map the same buffer several times
+	 * with different flags. Therefore, it is safe to use refcounting here,
+	 * since the value of "flags" will be the same with multiple map calls. */
 
-	if (flags & GST_MAP_READ)
-		prot |= PROT_READ;
-	if (flags & GST_MAP_WRITE)
-		prot |= PROT_WRITE;
-
-	phys_mem->mapped_virt_addr = mmap(0, size, prot, MAP_SHARED, gst_imx_ipu_get_fd(), (dma_addr_t)(phys_mem->phys_addr));
-	if (phys_mem->mapped_virt_addr == MAP_FAILED)
+	if (0 == g_atomic_int_add(&phys_mem->mapping_refcount, 1))
 	{
-		phys_mem->mapped_virt_addr = NULL;
-		GST_ERROR_OBJECT(ipu_allocator, "memory-mapping the IPU framebuffer failed: %s", strerror(errno));
-		return NULL;
+	    g_mutex_lock(&phys_mem->mutex);
+		phys_mem->mapping_flags = flags;
+		if (flags & GST_MAP_READ)
+			prot |= PROT_READ;
+		if (flags & GST_MAP_WRITE)
+			prot |= PROT_WRITE;
+
+		phys_mem->mapped_virt_addr = mmap(0, size, prot, MAP_SHARED, gst_imx_ipu_get_fd(), (dma_addr_t)(phys_mem->phys_addr));
+		if (phys_mem->mapped_virt_addr == MAP_FAILED)
+		{
+			phys_mem->mapped_virt_addr = NULL;
+			g_atomic_int_set (&phys_mem->mapping_refcount, 0);
+			GST_ERROR_OBJECT(ipu_allocator, "memory-mapping the IPU framebuffer failed: %s", strerror(errno));
+
+			g_mutex_unlock(&phys_mem->mutex);
+			return NULL;
+		}
+	    g_mutex_unlock(&phys_mem->mutex);
+	}
+	else
+	{
+		g_assert((phys_mem->mapping_flags & GST_MAP_WRITE) || !(flags & GST_MAP_WRITE));
 	}
 
 	GST_LOG_OBJECT(ipu_allocator, "mapped IPU physmem memory:  virt addr %p  phys addr %" GST_IMX_PHYS_ADDR_FORMAT, phys_mem->mapped_virt_addr, phys_mem->phys_addr);
@@ -126,19 +138,18 @@ static gpointer gst_imx_ipu_map_phys_mem(GstImxPhysMemAllocator *allocator, GstI
 }
 
 
-static void gst_imx_ipu_unmap_phys_mem(GstImxPhysMemAllocator *allocator, GstImxPhysMemory *memory)
+static void gst_imx_ipu_unmap_phys_mem(GstImxPhysMemAllocator *allocator, GstImxPhysMemory *phys_mem)
 {
-	if (memory->mapped_virt_addr != NULL)
+	if (g_atomic_int_dec_and_test(&phys_mem->mapping_refcount))
 	{
-		if (munmap(memory->mapped_virt_addr, memory->mem.maxsize) == -1)
+		g_mutex_lock(&phys_mem->mutex);
+		if (munmap(phys_mem->mapped_virt_addr, phys_mem->mem.maxsize) == -1)
 			GST_ERROR_OBJECT(allocator, "unmapping memory-mapped IPU framebuffer failed: %s", strerror(errno));
-		GST_LOG_OBJECT(allocator, "unmapped IPU physmem memory:  virt addr %p  phys addr %" GST_IMX_PHYS_ADDR_FORMAT, memory->mapped_virt_addr, memory->phys_addr);
-		memory->mapped_virt_addr = NULL;
+		GST_LOG_OBJECT(allocator, "unmapped IPU physmem memory:  virt addr %p  phys addr %" GST_IMX_PHYS_ADDR_FORMAT, phys_mem->mapped_virt_addr, phys_mem->phys_addr);
+		phys_mem->mapped_virt_addr = NULL;
+		g_mutex_unlock(&phys_mem->mutex);
 	}
 }
-
-
-
 
 static void gst_imx_ipu_allocator_class_init(GstImxIpuAllocatorClass *klass)
 {

@@ -67,9 +67,11 @@ struct _GstImxPhysMemory
 
 	GstMapFlags mapping_flags;
 
+	GMutex mutex;
+
 	/* Counter to ensure the memory block isn't (un)mapped
 	 * more often than necessary */
-	long mapping_refcount;
+	volatile gint mapping_refcount;
 
 	/* pointer for any additional internal data an allocator may define
 	 * not for outside use; allocators do not have to use it */
